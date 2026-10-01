@@ -1,0 +1,18 @@
+{
+  "allowed_projects": [
+    "mcp-memory"
+  ],
+  "allowed_scopes": [
+    "global",
+    "mcp-memory"
+  ],
+  "limits": {
+    "handoff_retention_days": 90,
+    "max_content_bytes": 52428800,
+    "max_handoffs": 2000,
+    "max_records": 10000,
+    "retention_days": 365
+  },
+  "mode": "scoped-single-tenant",
+  "schema_version": 1
+}

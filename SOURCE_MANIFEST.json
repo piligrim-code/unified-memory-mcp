@@ -1,0 +1,116 @@
+{
+  "schema_version": 1,
+  "project": "unified-memory-mcp",
+  "source_commit": "ad99a6a2a57ff995e767e0944444480e0231b650",
+  "license": "MIT",
+  "files": [
+    {
+      "source": "oss/README.md",
+      "target": "README.md",
+      "source_sha256": "0832c703a99dc8907a43db868ed9223fcf2a0e83e3c03bec0e34a62505b0e401",
+      "transform": null,
+      "sha256": "0832c703a99dc8907a43db868ed9223fcf2a0e83e3c03bec0e34a62505b0e401",
+      "bytes": 3301
+    },
+    {
+      "source": "oss/pyproject.toml",
+      "target": "pyproject.toml",
+      "source_sha256": "28e635c1909b1170164d011e0d5c2e5eb7eeaaa88263682d80b3e0e59521b533",
+      "transform": null,
+      "sha256": "28e635c1909b1170164d011e0d5c2e5eb7eeaaa88263682d80b3e0e59521b533",
+      "bytes": 610
+    },
+    {
+      "source": "oss/SECURITY.md",
+      "target": "SECURITY.md",
+      "source_sha256": "fa309e9f7521fea89ac72020182960123a48926763cd41c8618b26cd90b9cc28",
+      "transform": null,
+      "sha256": "fa309e9f7521fea89ac72020182960123a48926763cd41c8618b26cd90b9cc28",
+      "bytes": 777
+    },
+    {
+      "source": "oss/CONTRIBUTING.md",
+      "target": "CONTRIBUTING.md",
+      "source_sha256": "6672f34a34da4e894ae3d97d570fff0215802a041c0e162ccc4c7ec8d00993e4",
+      "transform": null,
+      "sha256": "6672f34a34da4e894ae3d97d570fff0215802a041c0e162ccc4c7ec8d00993e4",
+      "bytes": 639
+    },
+    {
+      "source": "oss/gitignore",
+      "target": ".gitignore",
+      "source_sha256": "00ed57c0689546104714a9e3252d2f690e42dbd68aa9e814594432668e133864",
+      "transform": null,
+      "sha256": "00ed57c0689546104714a9e3252d2f690e42dbd68aa9e814594432668e133864",
+      "bytes": 149
+    },
+    {
+      "source": "oss/LICENSE",
+      "target": "LICENSE",
+      "source_sha256": "bdce49ce59d498689a2fbb3dbe815a9d4c0599f94b4cecb8bfa832884da3bc01",
+      "transform": null,
+      "sha256": "bdce49ce59d498689a2fbb3dbe815a9d4c0599f94b4cecb8bfa832884da3bc01",
+      "bytes": 1075
+    },
+    {
+      "source": "server.py",
+      "target": "server.py",
+      "source_sha256": "93550f58fbd1671d7b427f24bc9999edf94d88fa91ef808dda2a04c875ba7e05",
+      "transform": "public_server",
+      "sha256": "cf20fb626a26e02ca3f4b4cb9ca859ea66464f6c4bec76e8c1cf00279350865d",
+      "bytes": 50535
+    },
+    {
+      "source": "gateway.py",
+      "target": "gateway.py",
+      "source_sha256": "fd021fdaaa89375038e1a3d1b4ee1dd9470140b400c61e0aa8b53c3763d6557c",
+      "transform": "public_gateway",
+      "sha256": "70c8e63c272bd713b73a4cfa2c1cdbb8548ca6f02d23fc82dfd05f3d0700ee3c",
+      "bytes": 16757
+    },
+    {
+      "source": "memory_admin.py",
+      "target": "memory_admin.py",
+      "source_sha256": "af0ea134bafba25036809a7497facad4fecb2b07d553c40742e3abd6c7858433",
+      "transform": null,
+      "sha256": "af0ea134bafba25036809a7497facad4fecb2b07d553c40742e3abd6c7858433",
+      "bytes": 31977
+    },
+    {
+      "source": "tests/test_memory.py",
+      "target": "tests/test_memory.py",
+      "source_sha256": "5743ba74548679f8398e741482db70ea06dfda52fd9746276c59eb04f759b919",
+      "transform": "public_test_memory",
+      "sha256": "17d58ec841bf19a34fd69958eb17c1a6624b6bc4abbae6c49bad942f47fc9ccf",
+      "bytes": 20321
+    },
+    {
+      "source": "profiles/single-tenant-bounded.json",
+      "target": "profiles/single-tenant-bounded.json",
+      "source_sha256": "dbcedb8d8f8047ac64b6f0c43b24ab80d09b37233ec4ebb0622b792aad013441",
+      "transform": null,
+      "sha256": "dbcedb8d8f8047ac64b6f0c43b24ab80d09b37233ec4ebb0622b792aad013441",
+      "bytes": 330
+    },
+    {
+      "source": "oss/public_defaults_fixture.py",
+      "target": "tests/test_public_defaults.py",
+      "source_sha256": "6d851e77645cb1c8043347d2b81bb95c3332d2c7dd6b8ed37021ccc97c1be916",
+      "transform": null,
+      "sha256": "6d851e77645cb1c8043347d2b81bb95c3332d2c7dd6b8ed37021ccc97c1be916",
+      "bytes": 2367
+    },
+    {
+      "source": "staging/.github/workflows/tests.yml",
+      "target": ".github/workflows/tests.yml",
+      "source_sha256": "11c45097402840dd02533fec606ad6e1a7964460bf97c1ee605fd8a022a7cb5c",
+      "transform": "added_public_ci",
+      "sha256": "11c45097402840dd02533fec606ad6e1a7964460bf97c1ee605fd8a022a7cb5c",
+      "bytes": 443
+    }
+  ],
+  "scope": "MIT local single-tenant public-safe 2.5.1; no personal vault, sync utility, credentials, data or history.",
+  "public_upload_performed": false,
+  "history_included": false,
+  "transformer_sha256": "107f6ce14472ede84f453cebd446e5e96ef88796eba2f2b049d4e76158365860"
+}
