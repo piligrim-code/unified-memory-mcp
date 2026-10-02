@@ -15,7 +15,7 @@ class PublicDefaultsTest(unittest.TestCase):
         self.assertFalse(hasattr(server, "sealed_records"))
         self.assertEqual(server._sealed_hits("anything", 5, None), [])
         self.assertEqual(server.DEFAULT_CLAUDE_MEM_GLOB, "")
-        self.assertEqual(server.SERVER_VERSION, "2.5.1")
+        self.assertEqual(server.SERVER_VERSION, "3.0.0rc1")
 
     def test_gateway_requires_explicit_workspace(self):
         path = Path(server.__file__).with_name("gateway.py")

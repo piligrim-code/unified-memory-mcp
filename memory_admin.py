@@ -699,6 +699,16 @@ def write_preflight_report(report: dict[str, Any], output: Path) -> Path:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Unified Memory backup administration")
     subparsers = parser.add_subparsers(dest="command", required=True)
+    doctor_parser = subparsers.add_parser("doctor")
+    doctor_parser.add_argument("--db", type=Path, required=True)
+    export_parser = subparsers.add_parser("export-project")
+    export_parser.add_argument("--db", type=Path, required=True)
+    export_parser.add_argument("--project", required=True)
+    export_parser.add_argument("--output", type=Path, required=True)
+    import_parser = subparsers.add_parser("import-project")
+    import_parser.add_argument("--input", type=Path, required=True)
+    import_parser.add_argument("--db", type=Path, required=True)
+    import_parser.add_argument("--confirm", action="store_true")
     backup_parser = subparsers.add_parser("backup")
     backup_parser.add_argument("--db", type=Path, required=True)
     backup_parser.add_argument("--output", type=Path, required=True)
@@ -723,7 +733,21 @@ def main() -> int:
     profile_parser = subparsers.add_parser("write-deployment-profile")
     profile_parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    if args.command == "backup":
+    if args.command in ("doctor", "export-project", "import-project"):
+        from memory_transfer import doctor, export_project, import_project
+        try:
+            if args.command == "doctor":
+                result = doctor(args.db)
+            elif args.command == "export-project":
+                result = export_project(args.db, args.output, args.project)
+            else:
+                result = import_project(args.input, args.db, confirm=args.confirm)
+        except Exception as exc:
+            print(json.dumps({"ok": False, "error_type": type(exc).__name__, "content_included": False}))
+            return 1
+        print(json.dumps(result))
+        return 0 if result.get("ok", True) else 1
+    elif args.command == "backup":
         output, manifest = backup(args.db, args.output)
         print(f"backup created: {output} manifest={manifest}")
     elif args.command == "verify":

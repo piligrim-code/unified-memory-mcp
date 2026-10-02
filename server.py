@@ -30,9 +30,11 @@ import subprocess
 import sys
 import threading
 import traceback
+from functools import wraps
 from datetime import datetime, timedelta, timezone
 SERVER_NAME = 'unified-memory'
-SERVER_VERSION = '2.5.1'
+SERVER_VERSION = '3.0.0rc1'
+SCHEMA_VERSION = 1
 DEFAULT_CLAUDE_MEM_GLOB = ''
 DEFAULT_PROTOCOL = '2025-06-18'
 EMBED_MODEL = os.environ.get('MEMORY_EMBED_MODEL', 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
@@ -60,10 +62,16 @@ def conn() -> sqlite3.Connection:
                 pass
         c = sqlite3.connect(path, timeout=30.0)
         c.row_factory = sqlite3.Row
-        c.execute('PRAGMA journal_mode=WAL')
-        c.execute('PRAGMA busy_timeout=30000')
-        c.execute('PRAGMA foreign_keys=ON')
-        _init_schema(c)
+        try:
+            if c.execute('PRAGMA user_version').fetchone()[0] > SCHEMA_VERSION:
+                raise ValueError('Unsupported database schema; refusing to change journal mode')
+            c.execute('PRAGMA journal_mode=WAL')
+            c.execute('PRAGMA busy_timeout=30000')
+            c.execute('PRAGMA foreign_keys=ON')
+            _init_schema(c)
+        except BaseException:
+            c.close()
+            raise
         _thread_connections.connection = c
         _thread_connections.path = path
     if threading.current_thread() is threading.main_thread():
@@ -83,8 +91,74 @@ def close_thread_connection() -> None:
             _conn = None
 
 def _init_schema(c: sqlite3.Connection) -> None:
+    if c.execute('PRAGMA user_version').fetchone()[0] > SCHEMA_VERSION:
+        raise ValueError('Database schema is newer than this server; refusing to modify it')
     c.executescript("\n        CREATE TABLE IF NOT EXISTS memories (\n            id         INTEGER PRIMARY KEY AUTOINCREMENT,\n            content    TEXT NOT NULL,\n            tags       TEXT NOT NULL DEFAULT '[]',\n            source     TEXT NOT NULL DEFAULT '',\n            scope      TEXT NOT NULL DEFAULT 'global',\n            created_at TEXT NOT NULL,\n            updated_at TEXT NOT NULL\n        );\n\n        CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts\n            USING fts5(content, tags, content='memories', content_rowid='id');\n\n        CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN\n            INSERT INTO memories_fts(rowid, content, tags)\n            VALUES (new.id, new.content, new.tags);\n        END;\n        CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN\n            INSERT INTO memories_fts(memories_fts, rowid, content, tags)\n            VALUES ('delete', old.id, old.content, old.tags);\n        END;\n        CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN\n            INSERT INTO memories_fts(memories_fts, rowid, content, tags)\n            VALUES ('delete', old.id, old.content, old.tags);\n            INSERT INTO memories_fts(rowid, content, tags)\n            VALUES (new.id, new.content, new.tags);\n        END;\n\n        -- v1.1: chunks with optional embedding vectors\n        CREATE TABLE IF NOT EXISTS chunks (\n            id         INTEGER PRIMARY KEY AUTOINCREMENT,\n            memory_id  INTEGER NOT NULL,\n            ord        INTEGER NOT NULL,\n            text       TEXT NOT NULL,\n            embedding  BLOB,\n            FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE\n        );\n        CREATE INDEX IF NOT EXISTS chunks_mem ON chunks(memory_id);\n\n        -- v2: structured cross-client work checkpoints\n        CREATE TABLE IF NOT EXISTS handoffs (\n            id             INTEGER PRIMARY KEY AUTOINCREMENT,\n            project        TEXT NOT NULL,\n            session_id     TEXT NOT NULL DEFAULT '',\n            source         TEXT NOT NULL,\n            target         TEXT NOT NULL DEFAULT 'any',\n            status         TEXT NOT NULL DEFAULT 'ready',\n            task           TEXT NOT NULL DEFAULT '',\n            summary        TEXT NOT NULL,\n            completed_work TEXT NOT NULL DEFAULT '[]',\n            decisions      TEXT NOT NULL DEFAULT '[]',\n            files          TEXT NOT NULL DEFAULT '[]',\n            tests          TEXT NOT NULL DEFAULT '[]',\n            next_steps     TEXT NOT NULL DEFAULT '[]',\n            blockers       TEXT NOT NULL DEFAULT '[]',\n            notes          TEXT NOT NULL DEFAULT '',\n            metadata       TEXT NOT NULL DEFAULT '{}',\n            created_at     TEXT NOT NULL,\n            updated_at     TEXT NOT NULL,\n            resumed_at     TEXT,\n            resumed_by     TEXT NOT NULL DEFAULT ''\n        );\n        CREATE INDEX IF NOT EXISTS handoffs_project_updated\n            ON handoffs(project, updated_at DESC);\n        CREATE INDEX IF NOT EXISTS handoffs_status_target\n            ON handoffs(status, target, updated_at DESC);\n        ")
     c.commit()
+    _migrate_schema(c)
+
+
+def _migrate_schema(c):
+    # Serialize schema inspection and ALTERs across independently starting clients.
+    with c:
+        c.execute('BEGIN IMMEDIATE')
+        version = c.execute('PRAGMA user_version').fetchone()[0]
+        if version > SCHEMA_VERSION:
+            raise ValueError('Unsupported database schema')
+        if version == 0:
+            for table, definitions in (
+                ('handoffs', {'task_id': "TEXT NOT NULL DEFAULT ''", 'revision': 'INTEGER NOT NULL DEFAULT 1'}),
+                ('memories', {'revision': 'INTEGER NOT NULL DEFAULT 1', 'superseded_by': 'INTEGER',
+                              'superseded_at': 'TEXT'}),
+            ):
+                columns = {r[1] for r in c.execute('PRAGMA table_info(' + table + ')')}
+                for name, definition in definitions.items():
+                    if name not in columns:
+                        c.execute('ALTER TABLE ' + table + ' ADD COLUMN ' + name + ' ' + definition)
+            c.execute('CREATE INDEX IF NOT EXISTS handoffs_task ON handoffs(project, task_id, updated_at DESC, id DESC)')
+            c.execute('PRAGMA user_version=1')
+
+
+def write_transaction(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        c = conn()
+        with c:
+            c.execute('BEGIN IMMEDIATE')
+            return fn(*args, **kwargs)
+    return wrapped
+
+
+def _integer(args, name, default=None, minimum=0, maximum=20):
+    value = args.get(name, default)
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise ValueError('`%s` must be an integer in [%d, %d]' % (name, minimum, maximum))
+    return value
+
+
+def _boolean(args, name, default=False):
+    value = args.get(name, default)
+    if type(value) is not bool:
+        raise ValueError('`%s` must be a boolean' % name)
+    return value
+
+
+def _selector(args, name):
+    if name not in args:
+        return ''
+    value = args[name]
+    if (not isinstance(value, str) or not value.strip() or value != value.strip()
+            or len(value) > 200 or any(ord(c) < 32 for c in value)):
+        raise ValueError('`%s` must be a nonempty identifier of at most 200 characters' % name)
+    return value
+
+
+def _revision(args, row, action):
+    expected = _integer(args, 'expected_revision', minimum=1, maximum=2**63 - 1)
+    if expected != row['revision']:
+        return {action: False, 'id': row['id'], 'reason': 'conflict', 'current_revision': row['revision']}
+    return None
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec='seconds')
@@ -128,6 +202,8 @@ _embedder = None
 def get_embedder():
     """Lazy: fastembed if installed, else None (keyword-only)."""
     global _embedder
+    if os.environ.get('MEMORY_ENABLE_EMBEDDINGS') == '0':
+        return None
     if _embedder is None:
         try:
             from fastembed import TextEmbedding
@@ -242,6 +318,7 @@ def _sync_allowed(project_slug, pol):
         return True
     return project_slug in pol['whitelist']
 
+@write_transaction
 def autosync(c=None):
     """Pull every ~/.claude/projects/*/memory/*.md file into the store."""
     c = c or conn()
@@ -293,7 +370,7 @@ def autosync(c=None):
             except Exception:
                 current_tags = []
             if current_tags != tags_list:
-                c.execute('UPDATE memories SET tags=?, updated_at=? WHERE id=?', (tags, now_iso(), prev['id']))
+                c.execute('UPDATE memories SET tags=?, updated_at=?, revision=revision+1 WHERE id=?', (tags, now_iso(), prev['id']))
             unchanged += 1
             continue
         ts = now_iso()
@@ -303,7 +380,7 @@ def autosync(c=None):
             c.commit()
             return {'changed': changed, 'unchanged': unchanged, 'backfilled': 0, 'dirs': dirs, 'skipped': str(exc)}
         if prev is not None:
-            c.execute('UPDATE memories SET content=?, tags=?, updated_at=? WHERE id=?', (content, tags, ts, prev['id']))
+            c.execute('UPDATE memories SET content=?, tags=?, updated_at=?, revision=revision+1 WHERE id=?', (content, tags, ts, prev['id']))
             mid = prev['id']
         else:
             cur = c.execute('INSERT INTO memories(content, tags, source, scope, created_at, updated_at) VALUES(?,?,?,?,?,?)', (content, tags, 'claude', 'global', ts, ts))
@@ -453,6 +530,7 @@ def tool_memory_policy(args: dict) -> dict:
     projects = _project_allowlist()
     return {'mode': 'scoped-single-tenant' if scopes is not None or projects is not None else 'single-tenant', 'authorization': {'allowed_scopes': sorted(scopes) if scopes is not None else None, 'allowed_projects': sorted(projects) if projects is not None else None}, 'limits': limits, 'usage': {'records': int(row['records'] or 0), 'content_bytes': int(row['bytes'] or 0), 'oldest_created_at': row['oldest'], 'newest_updated_at': row['newest'], 'by_scope': _scope_usage(c, scopes), 'handoffs': _handoff_usage(c)}}
 
+@write_transaction
 def tool_memory_prune(args: dict) -> dict:
     """Delete records older than the configured retention window, explicitly."""
     limits = _memory_limits()
@@ -490,6 +568,7 @@ def tool_memory_prune(args: dict) -> dict:
                 c.executemany('DELETE FROM handoffs WHERE id=?', [(int(row['id']),) for row in handoff_rows])
     return {'pruned': len(ids), 'memory_pruned': len(ids), 'handoffs_pruned': len(handoff_rows), 'content_bytes': sum((int(row['bytes'] or 0) for row in rows)), 'cutoff': memory_cutoff, 'handoff_cutoff': handoff_cutoff, 'retention_days': limits['retention_days'], 'handoff_retention_days': limits['handoff_retention_days']}
 
+@write_transaction
 def tool_memory_save(args: dict) -> dict:
     content = (args.get('content') or '').strip()
     if not content:
@@ -504,7 +583,7 @@ def tool_memory_save(args: dict) -> dict:
     mid = cur.lastrowid
     nch = _index_memory(c, mid, content)
     c.commit()
-    return {'saved': True, 'id': mid, 'scope': scope, 'chunks': nch}
+    return {'saved': True, 'id': mid, 'scope': scope, 'chunks': nch, 'revision': 1}
 
 def _fts_query(query: str) -> str:
     bad = '"*():^-'
@@ -529,7 +608,7 @@ def tool_memory_search(args: dict) -> dict:
     fts = _fts_query(query)
     rows = []
     if fts:
-        sql = 'SELECT m.*, bm25(memories_fts) AS rank FROM memories_fts JOIN memories m ON m.id = memories_fts.rowid WHERE memories_fts MATCH ?'
+        sql = 'SELECT m.*, bm25(memories_fts) AS rank FROM memories_fts JOIN memories m ON m.id = memories_fts.rowid WHERE memories_fts MATCH ? AND m.superseded_by IS NULL'
         params = [fts]
         scope_clause = _scope_filter('m.scope', scope, params)
         if scope_clause:
@@ -538,7 +617,7 @@ def tool_memory_search(args: dict) -> dict:
         params.append(limit)
         rows = c.execute(sql, params).fetchall()
     if not rows:
-        sql = 'SELECT * FROM memories WHERE content LIKE ?'
+        sql = 'SELECT * FROM memories WHERE content LIKE ? AND superseded_by IS NULL'
         params = ['%' + query + '%']
         scope_clause = _scope_filter('scope', scope, params)
         if scope_clause:
@@ -567,11 +646,11 @@ def tool_memory_recall(args: dict) -> dict:
         except Exception:
             return []
     if qv:
-        sql = 'SELECT ch.memory_id AS memory_id, ch.text AS text, ch.embedding AS embedding, m.scope AS scope, m.tags AS tags, m.source AS source FROM chunks ch JOIN memories m ON m.id = ch.memory_id'
+        sql = 'SELECT ch.memory_id AS memory_id, ch.text AS text, ch.embedding AS embedding, m.scope AS scope, m.tags AS tags, m.source AS source, m.updated_at, m.revision FROM chunks ch JOIN memories m ON m.id = ch.memory_id WHERE m.superseded_by IS NULL'
         params = []
         scope_clause = _scope_filter('m.scope', scope, params)
         if scope_clause:
-            sql += ' WHERE ' + scope_clause
+            sql += ' AND ' + scope_clause
         scored = []
         for r in c.execute(sql, params):
             v = unpack_vec(r['embedding'])
@@ -579,14 +658,14 @@ def tool_memory_recall(args: dict) -> dict:
         scored.sort(key=lambda x: x[0], reverse=True)
         top = scored[:k]
         method = 'semantic'
-        results = [{'memory_id': r['memory_id'], 'score': round(float(s), 4), 'text': r['text'], 'scope': r['scope'], 'tags': parse_tags(r['tags']), 'source': r['source']} for s, r in top]
+        results = [{'memory_id': r['memory_id'], 'score': round(float(s), 4), 'text': r['text'], 'scope': r['scope'], 'tags': parse_tags(r['tags']), 'source': r['source'], 'updated_at': r['updated_at'], 'revision': r['revision'], 'reason': 'semantic_similarity'} for s, r in top if s > 0]
         for i, sr in enumerate(_sealed_hits(query, k, scope)):
             results.append({'memory_id': -1000 - i, 'score': 0.5, 'text': sr['content'], 'scope': 'archotec', 'tags': ['archotec', sr['name']], 'source': 'private-store-disabled'})
         return {'method': method, 'count': len(results), 'results': results}
     fts = _fts_query(query)
     rows = []
     if fts:
-        sql = 'SELECT m.id AS memory_id, m.scope AS scope, m.tags AS tags, m.source AS source, (SELECT text FROM chunks WHERE memory_id=m.id ORDER BY ord LIMIT 1) AS text, (SELECT content FROM memories WHERE id=m.id) AS content FROM memories_fts JOIN memories m ON m.id = memories_fts.rowid WHERE memories_fts MATCH ?'
+        sql = 'SELECT m.id AS memory_id, m.scope AS scope, m.tags AS tags, m.source AS source, m.updated_at, m.revision, (SELECT text FROM chunks WHERE memory_id=m.id ORDER BY ord LIMIT 1) AS text, m.content FROM memories_fts JOIN memories m ON m.id = memories_fts.rowid WHERE memories_fts MATCH ? AND m.superseded_by IS NULL'
         params = [fts]
         scope_clause = _scope_filter('m.scope', scope, params)
         if scope_clause:
@@ -594,11 +673,12 @@ def tool_memory_recall(args: dict) -> dict:
         sql += ' ORDER BY bm25(memories_fts) LIMIT ?'
         params.append(k)
         rows = c.execute(sql, params).fetchall()
-    results = [{'memory_id': r['memory_id'], 'score': 0.0, 'text': r['text'] or r['content'], 'scope': r['scope'], 'tags': parse_tags(r['tags']), 'source': r['source']} for r in rows]
+    results = [{'memory_id': r['memory_id'], 'score': 0.0, 'text': r['text'] or r['content'], 'scope': r['scope'], 'tags': parse_tags(r['tags']), 'source': r['source'], 'updated_at': r['updated_at'], 'revision': r['revision'], 'reason': 'keyword_match'} for r in rows]
     for i, sr in enumerate(_sealed_hits(query, k, scope)):
         results.append({'memory_id': -1000 - i, 'score': 0.5, 'text': sr['content'], 'scope': 'archotec', 'tags': ['archotec', sr['name']], 'source': 'private-store-disabled'})
     return {'method': 'keyword', 'count': len(results), 'results': results}
 
+@write_transaction
 def tool_memory_reindex(args: dict) -> dict:
     """(Re)chunk + (re)embed all memories. Run once after enabling embeddings."""
     c = conn()
@@ -644,6 +724,7 @@ def tool_memory_get(args: dict) -> dict:
     _authorized_scope(r['scope'])
     return {'found': True, 'memory': row_to_dict(r)}
 
+@write_transaction
 def tool_memory_update(args: dict) -> dict:
     mid = args.get('id')
     if mid is None:
@@ -653,9 +734,16 @@ def tool_memory_update(args: dict) -> dict:
     if not r:
         return {'updated': False, 'id': int(mid), 'reason': 'not found'}
     _authorized_scope(r['scope'])
+    conflict = _revision(args, r, 'updated')
+    if conflict:
+        return conflict
+    if r['superseded_by'] is not None:
+        raise ValueError('Superseded records are immutable; edit the replacement')
     sets, params, new_content = ([], [], None)
     if 'content' in args and args['content'] is not None:
         new_content = str(args['content']).strip()
+        if not new_content:
+            raise ValueError('content must not be empty')
         _enforce_memory_quota(c, new_content, replacing_id=int(mid))
         sets.append('content = ?')
         params.append(new_content)
@@ -663,10 +751,13 @@ def tool_memory_update(args: dict) -> dict:
         sets.append('tags = ?')
         params.append(_norm_tags(args['tags']))
     if 'scope' in args and args['scope'] is not None:
+        if args['scope'] != r['scope'] and c.execute('SELECT 1 FROM memories WHERE superseded_by=? LIMIT 1', (mid,)).fetchone():
+            raise ValueError('A replacement referenced by history cannot move to another scope')
         sets.append('scope = ?')
         params.append(_authorized_scope(args['scope']))
     if not sets:
         return {'updated': False, 'id': int(mid), 'reason': 'nothing to update'}
+    sets.append('revision = revision + 1')
     sets.append('updated_at = ?')
     params.append(now_iso())
     params.append(int(mid))
@@ -674,27 +765,59 @@ def tool_memory_update(args: dict) -> dict:
     if new_content is not None:
         _index_memory(c, int(mid), new_content)
     c.commit()
-    return {'updated': True, 'id': int(mid)}
+    return {'updated': True, 'id': int(mid), 'revision': r['revision'] + 1}
 
+@write_transaction
 def tool_memory_delete(args: dict) -> dict:
     mid = args.get('id')
     if mid is None:
         raise ValueError('`id` is required')
     c = conn()
-    row = c.execute('SELECT scope FROM memories WHERE id = ?', (int(mid),)).fetchone()
+    row = c.execute('SELECT * FROM memories WHERE id = ?', (int(mid),)).fetchone()
     if row:
         _authorized_scope(row['scope'])
+        conflict = _revision(args, row, 'deleted')
+        if conflict:
+            return conflict
     cur = c.execute('DELETE FROM memories WHERE id = ?', (int(mid),))
     c.commit()
     return {'deleted': cur.rowcount > 0, 'id': int(mid)}
+@write_transaction
+def tool_memory_supersede(args):
+    mid = _integer(args, 'id', minimum=1, maximum=2**63 - 1)
+    replacement_id = _integer(args, 'replacement_id', minimum=1, maximum=2**63 - 1)
+    c = conn()
+    row = c.execute('SELECT * FROM memories WHERE id=?', (mid,)).fetchone()
+    replacement = c.execute('SELECT * FROM memories WHERE id=?', (replacement_id,)).fetchone()
+    if row is None or replacement is None:
+        raise ValueError('Both records must exist')
+    _authorized_scope(row['scope'])
+    _authorized_scope(replacement['scope'])
+    if mid == replacement_id or row['scope'] != replacement['scope']:
+        raise ValueError('Replacement must be a different record in the same scope')
+    if row['superseded_by'] is not None or replacement['superseded_by'] is not None:
+        raise ValueError('Supersession requires two active records')
+    conflict = _revision(args, row, 'superseded')
+    if conflict:
+        return conflict
+    if _integer(args, 'replacement_revision', minimum=1, maximum=2**63 - 1) != replacement['revision']:
+        return {'superseded': False, 'reason': 'replacement_conflict', 'id': mid}
+    timestamp = now_iso()
+    c.execute('UPDATE memories SET superseded_by=?, superseded_at=?, updated_at=?, revision=revision+1 WHERE id=?',
+              (replacement_id, timestamp, timestamp, mid))
+    return {'superseded': True, 'id': mid, 'replacement_id': replacement_id, 'revision': row['revision'] + 1}
+
+
 HANDOFF_ARRAY_FIELDS = ('completed_work', 'decisions', 'files', 'tests', 'next_steps', 'blockers')
 HANDOFF_STATUSES = {'active', 'ready', 'blocked', 'completed'}
 
 def _project_key(value) -> str:
-    raw = str(value or 'global').strip().rstrip('/\\')
-    if not raw:
-        return 'global'
-    return re.split('[/\\\\]+', raw)[-1].strip().casefold() or 'global'
+    raw = str(value or 'global').strip()
+    if any(c in raw for c in '/\\:') or raw in ('.', '..'):
+        raise ValueError('project must be an explicit portable key, not a path; use repo@instance for collisions')
+    if len(raw) > 200 or any(ord(c) < 32 for c in raw):
+        raise ValueError('Invalid project key')
+    return raw.casefold() or 'global'
 
 def _authorized_project(value) -> str:
     project = _project_key(value)
@@ -724,24 +847,37 @@ def handoff_to_dict(r: sqlite3.Row) -> dict:
     result['metadata'] = _json_value(result.get('metadata'), {})
     return result
 
+@write_transaction
 def tool_handoff_save(args: dict) -> dict:
     """Create or update a structured checkpoint for another coding client."""
     project = _authorized_project(args.get('project'))
     source = str(args.get('source') or '').strip().casefold()
     if not source:
         raise ValueError("`source` is required (for example 'codex' or 'claude')")
-    session_id = str(args.get('session_id') or '').strip()
+    session_id = _selector(args, 'session_id')
+    task_id = _selector(args, 'task_id')
     c = conn()
     existing = None
     requested_id = args.get('id')
     if requested_id is not None:
-        existing = c.execute('SELECT * FROM handoffs WHERE id=?', (int(requested_id),)).fetchone()
+        requested_id = _integer(args, 'id', minimum=1, maximum=2**63 - 1)
+        existing = c.execute('SELECT * FROM handoffs WHERE id=?', (requested_id,)).fetchone()
         if not existing:
             raise ValueError('handoff id not found: %s' % requested_id)
         if existing['project'] != project or existing['source'] != source:
             raise PermissionError('handoff id is outside the authorized project/source')
     elif session_id:
-        existing = c.execute("SELECT * FROM handoffs WHERE project=? AND source=? AND session_id=? AND status!='completed' ORDER BY updated_at DESC LIMIT 1", (project, source, session_id)).fetchone()
+        existing = c.execute("SELECT * FROM handoffs WHERE project=? AND source=? AND session_id=? AND task_id=? AND status!='completed' ORDER BY updated_at DESC, id DESC LIMIT 1", (project, source, session_id, task_id)).fetchone()
+    if existing:
+        conflict = _revision(args, existing, 'saved')
+        if conflict:
+            return conflict
+        if 'task_id' in args and task_id != existing['task_id']:
+            raise ValueError('task_id cannot be changed in place; create a new checkpoint')
+        if 'session_id' in args and session_id != existing['session_id']:
+            raise ValueError('session_id cannot be changed in place')
+    elif 'expected_revision' in args:
+        raise ValueError('expected_revision refers to an existing checkpoint; no match found')
     _enforce_handoff_quota(c, existing)
     old = handoff_to_dict(existing) if existing else {}
     summary = str(args.get('summary', old.get('summary', ''))).strip()
@@ -751,7 +887,9 @@ def tool_handoff_save(args: dict) -> dict:
     if status not in HANDOFF_STATUSES:
         raise ValueError('`status` must be active, ready, blocked, or completed')
     target = str(args.get('target', old.get('target', 'any'))).strip().casefold() or 'any'
-    values = {'project': project, 'session_id': session_id or old.get('session_id', ''), 'source': source, 'target': target, 'status': status, 'task': str(args.get('task', old.get('task', ''))).strip(), 'summary': summary, 'notes': str(args.get('notes', old.get('notes', ''))).strip()}
+    values = {'project': project, 'session_id': session_id or old.get('session_id', ''),
+              'task_id': task_id or old.get('task_id', ''), 'revision': old.get('revision', 0) + 1,
+              'source': source, 'target': target, 'status': status, 'task': str(args.get('task', old.get('task', ''))).strip(), 'summary': summary, 'notes': str(args.get('notes', old.get('notes', ''))).strip()}
     for field in HANDOFF_ARRAY_FIELDS:
         value = _json_value(args[field], []) if field in args else old.get(field, [])
         if not isinstance(value, list):
@@ -762,7 +900,7 @@ def tool_handoff_save(args: dict) -> dict:
         raise ValueError('`metadata` must be an object')
     values['metadata'] = json.dumps(metadata, ensure_ascii=False)
     ts = now_iso()
-    columns = ('project', 'session_id', 'source', 'target', 'status', 'task', 'summary', 'completed_work', 'decisions', 'files', 'tests', 'next_steps', 'blockers', 'notes', 'metadata')
+    columns = ('project', 'session_id', 'task_id', 'revision', 'source', 'target', 'status', 'task', 'summary', 'completed_work', 'decisions', 'files', 'tests', 'next_steps', 'blockers', 'notes', 'metadata')
     params = [values[name] for name in columns]
     if existing:
         sets = ', '.join((name + '=?' for name in columns))
@@ -781,24 +919,49 @@ def tool_handoff_save(args: dict) -> dict:
 def tool_handoff_load(args: dict) -> dict:
     project = _authorized_project(args.get('project'))
     consumer = str(args.get('consumer') or '').strip().casefold()
-    include_own = bool(args.get('include_own', False))
-    limit = max(1, min(int(args.get('limit') or 1), 20))
+    include_own = _boolean(args, 'include_own')
+    mark_resumed = _boolean(args, 'mark_resumed')
+    limit = _integer(args, 'limit', 1)
+    age = _integer(args, 'max_age_days', 30, minimum=1, maximum=3650)
+    selectors = {name: _selector(args, name) for name in ('task_id', 'session_id') if name in args}
+    if 'id' in args:
+        selectors['id'] = _integer(args, 'id', minimum=1, maximum=2**63 - 1)
+    if mark_resumed and ('id' not in selectors or limit != 1):
+        raise ValueError('mark_resumed requires an explicit id and limit=1 after read-only discovery')
+    if not limit:
+        return {'project': project, 'count': 0, 'handoffs': [], 'reason': 'disabled'}
     c = conn()
-    where = ['project=?', "status!='completed'"]
-    params = [project]
+    where = ['project=?', "status!='completed'", 'updated_at>=?']
+    params = [project, (datetime.now(timezone.utc) - timedelta(days=age)).isoformat(timespec='seconds')]
+    for name, value in selectors.items():
+        where.append(name + '=?')
+        params.append(value)
     if consumer:
         where.append("(target='any' OR target=?)")
         params.append(consumer)
         if not include_own:
             where.append('source!=?')
             params.append(consumer)
-    rows = c.execute('SELECT * FROM handoffs WHERE ' + ' AND '.join(where) + ' ORDER BY updated_at DESC LIMIT ?', params + [limit]).fetchall()
-    if rows and bool(args.get('mark_resumed', True)) and consumer:
-        ts = now_iso()
-        c.executemany('UPDATE handoffs SET resumed_at=?, resumed_by=? WHERE id=?', [(ts, consumer, r['id']) for r in rows])
-        c.commit()
-        rows = [c.execute('SELECT * FROM handoffs WHERE id=?', (r['id'],)).fetchone() for r in rows]
-    return {'project': project, 'count': len(rows), 'handoffs': [handoff_to_dict(r) for r in rows]}
+    query = 'SELECT * FROM handoffs WHERE ' + ' AND '.join(where) + ' ORDER BY updated_at DESC, id DESC LIMIT ?'
+    rows = c.execute(query, params + [limit if selectors else 2]).fetchall()
+    if not selectors and len(rows) > 1:
+        return {'project': project, 'count': 0, 'handoffs': [], 'reason': 'ambiguous'}
+    if rows and mark_resumed:
+        if not consumer:
+            raise ValueError('consumer is required to mark a handoff resumed')
+        expected = _integer(args, 'expected_revision', minimum=1, maximum=2**63 - 1)
+        with c:
+            c.execute('BEGIN IMMEDIATE')
+            # Recheck all filters under the write lock, not the earlier snapshot.
+            current = c.execute(query, params + [1]).fetchone()
+            if current is None or current['revision'] != expected:
+                return {'project': project, 'count': 0, 'handoffs': [], 'reason': 'conflict'}
+            c.execute('UPDATE handoffs SET resumed_at=?, resumed_by=?, revision=revision+1 WHERE id=?',
+                      (now_iso(), consumer, current['id']))
+            rows = [c.execute('SELECT * FROM handoffs WHERE id=?', (current['id'],)).fetchone()]
+    return {'project': project, 'count': len(rows), 'handoffs': [handoff_to_dict(r) for r in rows],
+            'reason': 'selected' if rows else 'no_match',
+            'selection': {'selectors': list(selectors), 'order': 'updated_at_desc,id_desc', 'max_age_days': age}}
 
 def tool_handoff_list(args: dict) -> dict:
     project = _authorized_project(args.get('project'))
@@ -813,6 +976,7 @@ def tool_handoff_list(args: dict) -> dict:
     rows = conn().execute('SELECT * FROM handoffs WHERE ' + ' AND '.join(where) + ' ORDER BY updated_at DESC LIMIT ?', params + [limit]).fetchall()
     return {'project': project, 'count': len(rows), 'handoffs': [handoff_to_dict(r) for r in rows]}
 
+@write_transaction
 def tool_handoff_complete(args: dict) -> dict:
     hid = args.get('id')
     if hid is None:
@@ -822,21 +986,59 @@ def tool_handoff_complete(args: dict) -> dict:
     if not row:
         return {'completed': False, 'id': int(hid), 'reason': 'not found'}
     _authorized_project(row['project'])
+    conflict = _revision(args, row, 'completed')
+    if conflict:
+        return conflict
     notes = str(args.get('notes', row['notes'] or '')).strip()
-    c.execute("UPDATE handoffs SET status='completed', notes=?, updated_at=? WHERE id=?", (notes, now_iso(), int(hid)))
+    c.execute("UPDATE handoffs SET status='completed', notes=?, updated_at=?, revision=revision+1 WHERE id=?", (notes, now_iso(), int(hid)))
     c.commit()
-    return {'completed': True, 'id': int(hid)}
+    return {'completed': True, 'id': int(hid), 'revision': row['revision'] + 1}
 
 def tool_memory_bootstrap(args: dict) -> dict:
     """Return the latest cross-client checkpoint plus relevant durable memory."""
-    project = _project_key(args.get('project'))
+    project = _authorized_project(args.get('project'))
     consumer = str(args.get('consumer') or '').strip().casefold()
     query = str(args.get('query') or project).strip()
-    handoff = tool_handoff_load({'project': project, 'consumer': consumer, 'limit': int(args.get('handoff_limit') or 1), 'mark_resumed': args.get('mark_resumed', True)})
-    memories = tool_memory_recall({'query': query, 'k': max(1, min(int(args.get('memory_limit') or 5), 20)), **({'scope': args['scope']} if args.get('scope') else {})})
+    handoff_limit = _integer(args, 'handoff_limit', 1)
+    memory_limit = _integer(args, 'memory_limit', 5)
+    selectors = {k: args[k] for k in ('task_id', 'session_id', 'id', 'expected_revision', 'max_age_days') if k in args}
+    handoff = tool_handoff_load({'project': project, 'consumer': consumer, 'limit': handoff_limit,
+                                'mark_resumed': _boolean(args, 'mark_resumed'), **selectors})
+    scope = _selector(args, 'scope') if 'scope' in args else project
+    memories = (tool_memory_recall({'query': query, 'k': memory_limit, 'scope': scope})
+                if memory_limit else {'method': 'disabled', 'count': 0, 'results': []})
     return {'project': project, 'consumer': consumer, 'handoff': handoff, 'memories': memories}
 TOOLS = [{'name': 'memory_save', 'description': 'Save a memory (fact, preference, decision, context) to the shared local store that both Codex and Claude read. Auto-chunked and embedded for semantic recall. Use for durable info worth recalling.', 'inputSchema': {'type': 'object', 'properties': {'content': {'type': 'string', 'description': 'The fact to remember.'}, 'tags': {'type': 'array', 'items': {'type': 'string'}, 'description': 'Optional tags.'}, 'scope': {'type': 'string', 'description': "Bucket, e.g. 'global' or a project. Default 'global'."}, 'source': {'type': 'string', 'description': "Who is writing, e.g. 'claude' or 'codex'."}}, 'required': ['content']}}, {'name': 'memory_recall', 'description': 'Semantic recall from memory: returns the most RELEVANT chunks by meaning (cosine over embeddings), falling back to keyword search if embeddings are off. Prefer this over memory_search when you want the best context for a topic.', 'inputSchema': {'type': 'object', 'properties': {'query': {'type': 'string', 'description': 'What you want to recall.'}, 'k': {'type': 'integer', 'description': 'How many chunks (default 5).'}, 'scope': {'type': 'string', 'description': 'Optional scope filter.'}}, 'required': ['query']}}, {'name': 'memory_search', 'description': 'Full-text (keyword) search of whole memories. Returns ranked matches.', 'inputSchema': {'type': 'object', 'properties': {'query': {'type': 'string'}, 'limit': {'type': 'integer', 'description': 'Max results (default 10).'}, 'scope': {'type': 'string'}}, 'required': ['query']}}, {'name': 'memory_reindex', 'description': 'Rebuild chunks + embeddings for all memories. Run once after enabling embeddings (fastembed).', 'inputSchema': {'type': 'object', 'properties': {}}}, {'name': 'memory_policy', 'description': 'Report content-free scope authorization, quota, retention, and usage state.', 'inputSchema': {'type': 'object', 'properties': {}}}, {'name': 'memory_prune', 'description': 'Delete expired memories and completed handoffs. Requires confirm=true.', 'inputSchema': {'type': 'object', 'properties': {'confirm': {'type': 'boolean'}}, 'required': ['confirm']}}, {'name': 'memory_sync', 'description': "Pull Claude's file memories (*.md) into the store. Idempotent and cheap: only files whose content changed are rewritten and re-embedded. Runs automatically on server start.", 'inputSchema': {'type': 'object', 'properties': {}}}, {'name': 'memory_bootstrap', 'description': 'Start or resume work across Codex and Claude. Returns the latest active handoff from another client plus relevant durable memory chunks. Call once at the beginning of substantial work.', 'inputSchema': {'type': 'object', 'properties': {'project': {'type': 'string', 'description': 'Stable repo/project name or path.'}, 'consumer': {'type': 'string', 'description': 'codex, claude, or claude-remote.'}, 'query': {'type': 'string', 'description': 'Current task/topic for memory recall.'}, 'handoff_limit': {'type': 'integer'}, 'memory_limit': {'type': 'integer'}, 'scope': {'type': 'string'}, 'mark_resumed': {'type': 'boolean'}}, 'required': ['project', 'consumer']}}, {'name': 'handoff_save', 'description': 'Create or update a structured work checkpoint so another Claude/Codex session can continue from the same state. Reuses project+source+session_id.', 'inputSchema': {'type': 'object', 'properties': {'id': {'type': 'integer'}, 'project': {'type': 'string'}, 'session_id': {'type': 'string'}, 'source': {'type': 'string'}, 'target': {'type': 'string'}, 'status': {'type': 'string', 'enum': ['active', 'ready', 'blocked', 'completed']}, 'task': {'type': 'string'}, 'summary': {'type': 'string'}, 'completed_work': {'type': 'array', 'items': {}}, 'decisions': {'type': 'array', 'items': {}}, 'files': {'type': 'array', 'items': {}}, 'tests': {'type': 'array', 'items': {}}, 'next_steps': {'type': 'array', 'items': {}}, 'blockers': {'type': 'array', 'items': {}}, 'notes': {'type': 'string'}, 'metadata': {'type': 'object'}}, 'required': ['project', 'source', 'summary']}}, {'name': 'handoff_load', 'description': 'Load recent unfinished handoffs for a project, normally from another client.', 'inputSchema': {'type': 'object', 'properties': {'project': {'type': 'string'}, 'consumer': {'type': 'string'}, 'include_own': {'type': 'boolean'}, 'mark_resumed': {'type': 'boolean'}, 'limit': {'type': 'integer'}}, 'required': ['project', 'consumer']}}, {'name': 'handoff_list', 'description': 'Audit recent handoff checkpoints for a project.', 'inputSchema': {'type': 'object', 'properties': {'project': {'type': 'string'}, 'status': {'type': 'string'}, 'limit': {'type': 'integer'}}, 'required': ['project']}}, {'name': 'handoff_complete', 'description': 'Mark a handoff complete once the transferred task is finished.', 'inputSchema': {'type': 'object', 'properties': {'id': {'type': 'integer'}, 'notes': {'type': 'string'}}, 'required': ['id']}}, {'name': 'memory_list', 'description': 'List most recently updated memories, optionally filtered by scope or tag.', 'inputSchema': {'type': 'object', 'properties': {'limit': {'type': 'integer'}, 'scope': {'type': 'string'}, 'tag': {'type': 'string'}}}}, {'name': 'memory_get', 'description': 'Fetch a single memory by id.', 'inputSchema': {'type': 'object', 'properties': {'id': {'type': 'integer'}}, 'required': ['id']}}, {'name': 'memory_update', 'description': "Update a memory's content, tags, or scope by id (re-chunks on content change).", 'inputSchema': {'type': 'object', 'properties': {'id': {'type': 'integer'}, 'content': {'type': 'string'}, 'tags': {'type': 'array', 'items': {'type': 'string'}}, 'scope': {'type': 'string'}}, 'required': ['id']}}, {'name': 'memory_delete', 'description': 'Delete a memory by id.', 'inputSchema': {'type': 'object', 'properties': {'id': {'type': 'integer'}}, 'required': ['id']}}]
 DISPATCH = {'memory_save': tool_memory_save, 'memory_recall': tool_memory_recall, 'memory_search': tool_memory_search, 'memory_reindex': tool_memory_reindex, 'memory_policy': tool_memory_policy, 'memory_prune': tool_memory_prune, 'memory_sync': tool_memory_sync, 'memory_bootstrap': tool_memory_bootstrap, 'handoff_save': tool_handoff_save, 'handoff_load': tool_handoff_load, 'handoff_list': tool_handoff_list, 'handoff_complete': tool_handoff_complete, 'memory_list': tool_memory_list, 'memory_get': tool_memory_get, 'memory_update': tool_memory_update, 'memory_delete': tool_memory_delete}
+
+# Extend wire schemas together with the v3 contract; discovery stays read-only.
+for _tool in TOOLS:
+    _name = _tool['name']
+    _properties = _tool['inputSchema']['properties']
+    if _name in ('handoff_save', 'handoff_load', 'memory_bootstrap'):
+        _properties['task_id'] = {'type': 'string', 'minLength': 1, 'maxLength': 200}
+    if _name in ('handoff_load', 'memory_bootstrap'):
+        _properties.update({'id': {'type': 'integer', 'minimum': 1},
+                            'session_id': {'type': 'string', 'minLength': 1, 'maxLength': 200},
+                            'max_age_days': {'type': 'integer', 'minimum': 1, 'maximum': 3650, 'default': 30}})
+        _properties['mark_resumed']['default'] = False
+    if _name in ('handoff_save', 'handoff_load', 'handoff_complete', 'memory_bootstrap', 'memory_update', 'memory_delete'):
+        _properties['expected_revision'] = {'type': 'integer', 'minimum': 1,
+            'description': 'Required for mutation of an existing record; conflicts do not overwrite.'}
+    if _name in ('handoff_load', 'memory_bootstrap'):
+        _tool['description'] = 'Read-only task-scoped discovery. Ambiguity returns no selection; use task_id or id. Marking resumed needs id and expected_revision.'
+    if _name == 'memory_bootstrap':
+        _properties['project']['description'] = 'Explicit portable project key, not a filesystem path.'
+        for _limit in ('handoff_limit', 'memory_limit'):
+            _properties[_limit].update(minimum=0, maximum=20, description='Zero disables this result section.')
+    if _name == 'memory_sync':
+        _tool['description'] = 'Explicit import from operator-configured reviewed files; startup import is disabled by default.'
+TOOLS.append({'name': 'memory_supersede', 'description': 'Mark an old record obsolete using an active same-scope replacement. Both revisions must match.',
+              'inputSchema': {'type': 'object', 'properties': {k: {'type': 'integer', 'minimum': 1}
+                              for k in ('id', 'replacement_id', 'expected_revision', 'replacement_revision')},
+                              'required': ['id', 'replacement_id', 'expected_revision', 'replacement_revision']}})
+DISPATCH['memory_supersede'] = tool_memory_supersede
+
 
 def log(*a) -> None:
     print('[unified-memory]', *a, file=sys.stderr, flush=True)
