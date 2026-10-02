@@ -5,6 +5,10 @@ installation. Existing database records remain readable after an additive schema
 migration. Update every writer before sharing the migrated store: old servers do
 not implement revision checks and must not keep writing to it.
 
+Startup requires an explicit absolute `UNIFIED_MEMORY_DB` path. There is no
+fallback to a database in the user's home directory. Installing the package or
+running an unconfigured server therefore cannot silently migrate that store.
+
 ## Selection
 
 - Use an explicit portable `project` key. Filesystem paths are rejected instead

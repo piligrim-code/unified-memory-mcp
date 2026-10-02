@@ -4,6 +4,9 @@
 
 Breaking API candidate; not yet a package-registry or production release.
 
+- Startup requires an explicit absolute database path; no implicit home-store
+  selection or accidental migration from an unconfigured launch.
+
 - Read-only task/session/ID-scoped handoff discovery, explicit ambiguity and
   staleness handling, deterministic tie ordering and disabled zero-limit sections.
 - Bootstrap memory defaults to the project scope instead of a global search.

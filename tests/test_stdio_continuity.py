@@ -1,6 +1,8 @@
 import builtins
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 from unittest import mock
 
@@ -10,6 +12,19 @@ from test_continuity import StoreCase
 
 
 class StdioContinuityTest(StoreCase):
+    def test_unconfigured_startup_cannot_open_home_database(self):
+        for value in (None, 'relative.db'):
+            env = dict(os.environ, HOME=self.tmp.name, USERPROFILE=self.tmp.name)
+            env.pop('UNIFIED_MEMORY_DB', None)
+            if value is not None:
+                env['UNIFIED_MEMORY_DB'] = value
+            with self.subTest(value=value):
+                result = subprocess.run([sys.executable, server.__file__], input='', env=env,
+                                        capture_output=True, text=True, timeout=10, cwd=self.tmp.name)
+                self.assertEqual(2, result.returncode)
+                self.assertIn('UNIFIED_MEMORY_DB', result.stderr)
+                self.assertEqual([], list(Path(self.tmp.name).iterdir()))
+
     def test_two_clients_and_five_real_processes(self):
         result = memory_demo.demo(Path(self.tmp.name) / 'demo')
         self.assertTrue(result['ok'])

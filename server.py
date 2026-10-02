@@ -18,7 +18,7 @@ Enable embeddings by launching with fastembed available, e.g.:
 Without it the server runs keyword-only (zero-dep, instant start).
 
 Protocol: MCP over stdio (newline-delimited JSON-RPC 2.0).
-DB: env UNIFIED_MEMORY_DB, else %USERPROFILE%/.unified-memory/memory.db
+DB: an explicit absolute UNIFIED_MEMORY_DB path is required.
 """
 import glob
 import json
@@ -41,9 +41,8 @@ EMBED_MODEL = os.environ.get('MEMORY_EMBED_MODEL', 'sentence-transformers/paraph
 
 def db_path() -> str:
     p = os.environ.get('UNIFIED_MEMORY_DB')
-    if not p:
-        home = os.path.expanduser('~')
-        p = os.path.join(home, '.unified-memory', 'memory.db')
+    if not p or not os.path.isabs(p):
+        raise ValueError('UNIFIED_MEMORY_DB must explicitly name an absolute database path')
     os.makedirs(os.path.dirname(p), exist_ok=True)
     return p
 _conn = None
@@ -1075,7 +1074,12 @@ def handle_tools_call(params: dict) -> dict:
         return {'content': [{'type': 'text', 'text': f'Error in {name}: {e}'}], 'isError': True}
 
 def main() -> None:
-    log('starting v%s, db = %s' % (SERVER_VERSION, db_path()))
+    try:
+        path = db_path()
+    except ValueError as exc:
+        log(str(exc))
+        raise SystemExit(2)
+    log('starting v%s, db = %s' % (SERVER_VERSION, path))
     try:
         conn()
     except Exception:
