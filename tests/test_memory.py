@@ -44,7 +44,7 @@ class IsolatedStoreTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_server_version_matches_release(self):
-        self.assertEqual("2.5.1", server.SERVER_VERSION)
+        self.assertEqual("3.0.0rc1", server.SERVER_VERSION)
 
     def test_handoff_round_trip_and_session_upsert(self):
         saved = server.tool_handoff_save({
@@ -62,6 +62,7 @@ class IsolatedStoreTest(unittest.TestCase):
         handoff_id = saved["handoff"]["id"]
 
         updated = server.tool_handoff_save({
+            "expected_revision": saved["handoff"]["revision"],
             "project": "mcp-memory",
             "session_id": "claude-session-1",
             "source": "claude",
@@ -75,7 +76,8 @@ class IsolatedStoreTest(unittest.TestCase):
         self.assertEqual("Add cross-client continuity", updated["handoff"]["task"])
 
         loaded = server.tool_handoff_load({
-            "project": "mcp-memory", "consumer": "codex"
+            "project": "mcp-memory", "consumer": "codex", "id": handoff_id,
+            "mark_resumed": True, "expected_revision": updated["handoff"]["revision"]
         })
         self.assertEqual(1, loaded["count"])
         self.assertEqual("codex", loaded["handoffs"][0]["resumed_by"])
@@ -85,6 +87,7 @@ class IsolatedStoreTest(unittest.TestCase):
         server.tool_memory_save({
             "content": "mcp-memory keeps durable shared context",
             "source": "test",
+            "scope": "mcp-memory",
         })
         bootstrap = server.tool_memory_bootstrap({
             "project": "mcp-memory", "consumer": "codex", "query": "shared context"
@@ -92,7 +95,8 @@ class IsolatedStoreTest(unittest.TestCase):
         self.assertEqual(1, bootstrap["handoff"]["count"])
         self.assertGreaterEqual(bootstrap["memories"]["count"], 1)
 
-        completed = server.tool_handoff_complete({"id": handoff_id, "notes": "done"})
+        completed = server.tool_handoff_complete({"id": handoff_id, "notes": "done",
+                                                 "expected_revision": loaded["handoffs"][0]["revision"]})
         self.assertTrue(completed["completed"])
         self.assertEqual(0, server.tool_handoff_load({
             "project": "mcp-memory", "consumer": "codex"
@@ -170,9 +174,9 @@ class IsolatedStoreTest(unittest.TestCase):
         with self.assertRaisesRegex(PermissionError, "record quota"):
             server.tool_memory_save({"content": "x"})
         with self.assertRaisesRegex(PermissionError, "byte quota"):
-            server.tool_memory_update({"id": saved["id"], "content": "abcdef"})
+            server.tool_memory_update({"id": saved["id"], "content": "abcdef", "expected_revision": 1})
 
-        updated = server.tool_memory_update({"id": saved["id"], "content": "12345"})
+        updated = server.tool_memory_update({"id": saved["id"], "content": "12345", "expected_revision": 1})
         policy = server.tool_memory_policy({})
         self.assertTrue(updated["updated"])
         self.assertEqual(1, policy["usage"]["records"])
@@ -234,7 +238,7 @@ class IsolatedStoreTest(unittest.TestCase):
                 "project": "mcp-memory", "source": "other", "summary": "overflow"
             })
 
-        server.tool_handoff_complete({"id": completed["handoff"]["id"]})
+        server.tool_handoff_complete({"id": completed["handoff"]["id"], "expected_revision": 1})
         server.conn().execute(
             "UPDATE handoffs SET updated_at='2000-01-01T00:00:00+00:00' WHERE id IN (?,?)",
             (completed["handoff"]["id"], active["handoff"]["id"]),

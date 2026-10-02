@@ -1,4 +1,4 @@
-name: Public candidate tests
+name: Continuity candidate qualification
 on: [push, pull_request]
 permissions:
   contents: read
@@ -8,11 +8,33 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+        python: ['3.11', '3.12', '3.13']
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.12"
-      - run: python -m pip install .
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install build
+      - run: python -m build
+      - run: python -m pip install dist/unified_memory_mcp-3.0.0rc1-py3-none-any.whl
+      - run: python -m pip check
       - run: python -m unittest discover -s tests -v
+      - run: python -I -m memory_demo --work-root "${{ runner.temp }}/memory-demo"
+      - run: python -I -m memory_admin doctor --db "${{ runner.temp }}/memory-demo/synthetic.db"
+      - run: python -I -c "from pathlib import Path; import server; assert 'site-packages' in str(Path(server.__file__)); print(server.SERVER_VERSION)"
+  sdk:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        sdk: ['1.30.0', '2.3.0']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - run: python -m pip install "mcp==${{ matrix.sdk }}" .
+      - run: python -m pip check
+      - run: python -m unittest discover -s tests_sdk -v

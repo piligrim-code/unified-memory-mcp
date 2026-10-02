@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "unified-memory-mcp"
-version = "2.5.1"
+version = "3.0.0rc1"
 description = "Local single-tenant MCP memory, handoffs and verified backups"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -19,6 +19,7 @@ embeddings = ["fastembed"]
 unified-memory-mcp = "server:main"
 unified-memory-gateway = "gateway:main"
 unified-memory-admin = "memory_admin:main"
+unified-memory-demo = "memory_demo:main"
 
 [tool.setuptools]
-py-modules = ["server", "gateway", "memory_admin"]
+py-modules = ["server", "gateway", "memory_admin", "memory_transfer", "memory_demo"]

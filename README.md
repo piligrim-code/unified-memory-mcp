@@ -1,5 +1,18 @@
 # MCP Memory
 
+## v3 continuity candidate
+
+The current branch prepares `3.0.0rc1`: exact task selection, read-only bootstrap,
+revision-aware writes, superseded decisions, content-free diagnostics and explicit
+project transfer. **Existing writers must be updated** before using the migrated
+store. Read [the migration and continuity contract](docs/continuity-v3.md) and
+[release gates](docs/release-checklist.md). Nothing upgrades a live installation
+or imports private memory automatically.
+
+See [isolated client setup and tested boundaries](docs/client-setup.md) and the
+[voluntary pilot checklist](docs/pilot-checklist.md). Official MCP SDK checks
+are separate from the dependency-free core tests.
+
 Local, single-tenant memory and handoffs for MCP clients.
 
 The core uses Python's standard library and SQLite FTS5: no account, hosted
@@ -18,8 +31,9 @@ python -m unittest discover -s tests -v
 unified-memory-admin --help
 ```
 
-The distribution name is `unified-memory-mcp`. Version 2.5.1 in this snapshot
-is the public-safe candidate, not a claim that a package was uploaded.
+The distribution name is `unified-memory-mcp`. Version 3.0.0rc1 is a candidate,
+not a claim that a package was uploaded. The historical 2.5.1 public import is
+preserved in Git history; its source manifest is provenance, not a v3 checksum.
 
 ## Connect a stdio client
 
