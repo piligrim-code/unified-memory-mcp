@@ -1,8 +1,10 @@
 import builtins
+from contextlib import closing
 import json
 import os
 import subprocess
 import sys
+import sqlite3
 from pathlib import Path
 from unittest import mock
 
@@ -12,6 +14,34 @@ from test_continuity import StoreCase
 
 
 class StdioContinuityTest(StoreCase):
+    def test_initialize_negotiates_only_supported_revision(self):
+        for requested in ('2025-06-18', '2025-11-25', '2099-01-01', None):
+            with self.subTest(requested=requested):
+                result = server.handle_initialize({'protocolVersion': requested})
+                self.assertEqual(server.DEFAULT_PROTOCOL, result['protocolVersion'])
+                self.assertIn('revision', result['instructions'])
+
+    def test_conditional_writes_are_not_advertised_read_only(self):
+        tools = {t['name']: t for t in server.TOOLS}
+        self.assertTrue(tools['memory_get']['annotations']['readOnlyHint'])
+        for name in ('memory_bootstrap', 'handoff_load', 'handoff_save', 'memory_delete'):
+            with self.subTest(name=name):
+                self.assertFalse(tools[name]['annotations']['readOnlyHint'])
+
+    def test_invalid_database_cannot_advertise_healthy_startup(self):
+        database = Path(self.tmp.name) / 'future.db'
+        with closing(sqlite3.connect(database)) as connection:
+            connection.execute('PRAGMA user_version=999')
+        before = database.read_bytes()
+        env = dict(os.environ, UNIFIED_MEMORY_DB=str(database))
+        result = subprocess.run([sys.executable, server.__file__], env=env,
+                                input=json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize'}) + '\n',
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(1, result.returncode)
+        self.assertEqual('', result.stdout)
+        self.assertNotIn('Traceback', result.stderr)
+        self.assertEqual(before, database.read_bytes())
+
     def test_unconfigured_startup_cannot_open_home_database(self):
         for value in (None, 'relative.db'):
             env = dict(os.environ, HOME=self.tmp.name, USERPROFILE=self.tmp.name)

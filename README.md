@@ -9,6 +9,10 @@ store. Read [the migration and continuity contract](docs/continuity-v3.md) and
 [release gates](docs/release-checklist.md). Nothing upgrades a live installation
 or imports private memory automatically.
 
+See [isolated client setup and tested boundaries](docs/client-setup.md) and the
+[voluntary pilot checklist](docs/pilot-checklist.md). Official MCP SDK checks
+are separate from the dependency-free core tests.
+
 Local, single-tenant memory and handoffs for MCP clients.
 
 The core uses Python's standard library and SQLite FTS5: no account, hosted
